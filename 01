@@ -1,0 +1,1133 @@
+# PySpark Code - Databricks
+"""
+Sales prediction in the food distribution sector with facebook prophet library. With PySpark on the Databricks platform.
+"""
+	
+	
+	
+# imports	
+	
+dbutils.library.installPyPI("pystan")	
+dbutils.library.installPyPI("numpy")	
+dbutils.library.installPyPI("fbprophet")	
+dbutils.library.installPyPI("plotly")	
+dbutils.library.installPyPI('holidays')	
+	
+dbutils.library.restartPython() # Removes Python state, but some libraries might not work without calling this function	
+	
+# COMMAND ----------	
+	
+# dbutils.widgets.removeAll()	
+	
+# COMMAND ----------	
+	
+from datetime import datetime, timedelta	
+# dbutils.widgets.dropdown("Home delivery(1)/Collect(2)", "1", ["1", "2"])	
+# dbutils.widgets.text("article_number", "XXXXXXXXXXXX")	
+# dbutils.widgets.text("startdate", "20170101")	
+# dbutils.widgets.text("enddate", "20191231")	
+# dbutils.widgets.text("prediction_period (days)", "30")	
+	
+startdate = dbutils.widgets.get("startdate")	
+enddate = dbutils.widgets.get("enddate")	
+enddate2= datetime.strptime(enddate, '%Y%m%d').strftime('%Y-%m-%d')	
+prediction_period = int(dbutils.widgets.get("prediction_period (days)"))	
+art = dbutils.widgets.get("article_number")	
+st = dbutils.widgets.get("Home delivery(1)/Collect(2)")	
+# # print(type(st)) # string ok ça marche dans les filtres	
+# results_filtered = results.filter(results["home_delivery_or_collect"]==st).filter(results["article_number"]==art)	
+print('enddate: ' + enddate)	
+print('enddate2: ' + enddate2)	
+	
+# COMMAND ----------	
+	
+from pyspark.sql.functions import spark_partition_id, col, to_date, expr, when, round	
+from pyspark.sql.types import *	
+	
+	
+	
+enddate_dateformat = datetime.strptime(enddate, "%Y%m%d").date()	
+print(enddate_dateformat)	
+	
+enddate_evaluation_dateformat = enddate_dateformat + timedelta(days=prediction_period)	
+enddate_evaluation2 = str(enddate_evaluation_dateformat)	
+enddate_evaluation = datetime.strptime(enddate_evaluation2, '%Y-%m-%d').strftime('%Y%m%d')	
+# enddate_evaluation2= datetime.strptime(enddate_evaluation, '%Y%m%d').strftime('%Y-%m-%d')	
+	
+print('enddate_evaluation:' + enddate_evaluation)	
+print('enddate_evaluation2:' + enddate_evaluation2)	
+print(type(enddate_evaluation))	
+print(enddate_evaluation_dateformat)	
+print(type(enddate_evaluation_dateformat))	
+	
+# COMMAND ----------	
+	
+# .filter('Month = 3 AND Year = 2020')	
+# si = spark.read.csv("mnt/gen2/prod/Prepared/Reporting/Facts/ScannedItem/Year=2019/*/*/FactScannedItem.csv", header="true", inferSchema="false", sep = ",")	
+# si = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Facts/ScannedItem/").filter('Month IN (3,4,5) AND Year = 2019')	
+si = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Facts/ScannedItem/").filter('Year * 10000 + Month * 100 + Day >=' + "'{}'".format(startdate)+' AND Year * 10000 + Month * 100 + Day <='+ "'{}'".format(enddate))	
+# df = spark.read.option("delimiter", columnDelimiter).csv(URL , header="true").filter('Year * 10000 + Month * 100 + Day >=' + "'{}'".format(startDate)+' AND Year * 10000 + Month * 100 + Day <'+ "'{}'".format(endDate))	
+	
+	
+	
+# change date column format from string to date	
+si = si.withColumn('dl_emission_date_id', to_date(col('dl_emission_date_id'), "yyyyMMdd"))	
+	
+# add mapping column ecommerce home delivery (1) or collect (2) otherwise (0)	
+si = si.withColumn('home_delivery_or_collect', when(	
+                                                    col('is_ecommerce') == 'Y', 	
+                                                    when(	
+                                                         col('store_number') == '140007',1	
+                                                        ).otherwise(2)	
+                                                    ).otherwise(0)	
+                                                    )	
+	
+	
+# make the dataframe queriable as a temporary view	
+si.createOrReplaceTempView('si')	
+display(si)	
+	
+# COMMAND ----------	
+	
+# si.count() #544M vs 535M afterwards moi: sans doute à cause d'un > >=	
+	
+# COMMAND ----------	
+	
+#EDA	
+# si.select(col('home_delivery_or_collect').cast("string")).groupBy('home_delivery_or_collect').count().toPandas()	
+	
+# COMMAND ----------	
+	
+store = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Dimensions/DimStore.csv")	
+	
+# make the dataframe queriable as a temporary view	
+store.createOrReplaceTempView('store')	
+	
+display(store)	
+	
+# COMMAND ----------	
+	
+article = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Dimensions/DimArticle.csv")	
+# make the dataframe queriable as a temporary view	
+article.createOrReplaceTempView('article')	
+display(article)	
+	
+# COMMAND ----------	
+	
+#EDA	
+#si.select(col('article_number').cast("string")).groupBy('article_number').count().toPandas().head(20)	
+	
+
+	
+# COMMAND ----------	
+	
+# query to aggregate data to date (ds) level	
+sql_statement = '''	
+SELECT 	
+  	
+  si.dl_emission_date_id AS ds,	
+  --s.store_number, 	
+  si.home_delivery_or_collect,	
+  si.article_number, 	
+  sum(si.number_of_items) AS y	
+  	
+FROM 	
+  si AS si 	
+  INNER JOIN store AS s 	
+    ON si.sap_site_identifier = s.sap_site_identifier 	
+  INNER JOIN article AS a 	
+    ON si.hope_number==a.hope_number AND  si.article_number = a.article_number 	
+	
+WHERE 	
+si.home_delivery_or_collect = "''' + st + '''" AND --ecommerce home delivery and collect	
+--si.home_delivery_or_collect IN ('1', '2') AND --ecommerce home delivery and collect	
+si.article_number != '?' 	
+AND si.article_number = "''' + art + '''" -- most items sold 140007 zuchinis	
+AND (a.status_code = '0' OR a.is_deleted = 'N')	
+	
+GROUP BY	
+  si.dl_emission_date_id, 	
+  --s.store_number,	
+  si.home_delivery_or_collect,	
+  si.article_number	
+  	
+ORDER BY	
+  si.dl_emission_date_id	
+'''	
+
+	
+	
+	
+# COMMAND ----------	
+	
+import numpy as np	
+from matplotlib import pyplot as plt	
+from fbprophet import Prophet	
+import logging	
+	
+# disable informational messages from fbprophet	
+logging.getLogger('py4j').setLevel(logging.ERROR)	
+	
+	
+# COMMAND ----------	
+	
+store_item_history = (	
+  spark	
+    .sql( sql_statement ) #see above	
+    #.repartition(sc.defaultParallelism, ['store_number', 'article_number'])	
+    .repartition(sc.defaultParallelism, ['home_delivery_or_collect', 'article_number'])	
+  ).cache()	
+	
+# print(store_item_history.count())	
+	
+# plus tard df = spark.read.parquer(PATH) no need to reread scanned items	
+# integrer path gen2	
+# store_item_history.write.parquet("/mnt/DataScience/sandbox/gmc/store_item_history")	
+	
+# COMMAND ----------	
+	
+# MAGIC %md With our data aggregated at the store-item-date level, we need to consider how we will pass our data to FBProphet. If our goal is to build a model for each store and item combination, we will need to pass in a store-item subset from the dataset we just assembled, train a model on that subset, and receive a store-item forecast back. We'd expect that forecast to be returned as a dataset with a structure like this where we retain the store and item identifiers for which the forecast was assembled and we limit the output to just the relevant subset of fields generated by the Prophet model:	
+	
+# COMMAND ----------	
+	
+	
+	
+# Regressor belgian scholar holidays	
+def is_be_scholar_holiday(ds):	
+  from datetime import datetime, timedelta	
+  import holidays	
+  import pandas as pd	
+  	
+  date = pd.to_datetime(ds)	
+  # date = ds	
+  	
+  holidays_belgium = holidays.Belgium(years= [x for x in range(2016,2025)])	
+  Allerheiligen = [pd.to_datetime(x) for x,y in holidays_belgium.items() if y == 'Allerheiligen']	
+  Kerstmis = [pd.to_datetime(x) for x,y in holidays_belgium.items() if y == 'Kerstmis']	
+  Pasen = [pd.to_datetime(x) for x,y in holidays_belgium.items() if y == 'Pasen']	
+  	
+  # summer holidays	
+  if date.month *100 + date.day >= 701  and date.month *100 + date.day < 901:	
+    return 1	
+  	
+  #Allerheiligen	
+  for y in Allerheiligen:	
+    if y.dayofweek == 6:    	
+      if y + timedelta(days= -1) <= date and date <= y + timedelta(days= 7):	
+        return 1	
+        	
+    elif y.dayofweek == 0:	
+      if y + timedelta(days= -2) <= date and date <= y + timedelta(days= 6):	
+        return 1 	
+    	
+    elif y.dayofweek == 1:    	
+      if y + timedelta(days= -3) <= date and date <= y + timedelta(days= 5):	
+        return 1	
+    	
+    elif y.dayofweek == 2:    	
+      if y + timedelta(days= -4) <= date and date <= y + timedelta(days= 4):	
+        return 1	
+    	
+    elif y.dayofweek == 3:    	
+      if y + timedelta(days= -5) <= date and date <= y + timedelta(days= 3):	
+        return 1	
+    	
+    elif y.dayofweek == 4:    	
+      if y + timedelta(days= -6) <= date and date <= y + timedelta(days= 2):	
+        return 1	
+    	
+    elif y.dayofweek == 5:    	
+      if y + timedelta(days= -7) <= date and date <= y + timedelta(days= 1):	
+        return 1 	
+      	
+  #Kerstmis	
+  for y in Kerstmis:	
+    if y.dayofweek == 5:    	
+      if y  <= date and date <= y + timedelta(days= 15):	
+        return 1	
+        	
+    elif y.dayofweek == 6:	
+      if y + timedelta(days= -1) <= date and date <= y + timedelta(days= 14):	
+        return 1 	
+    	
+    elif y.dayofweek == 0:    	
+      if y + timedelta(days= -2) <= date and date <= y + timedelta(days= 13):	
+        return 1	
+    	
+    elif y.dayofweek == 1:    	
+      if y + timedelta(days= -3) <= date and date <= y + timedelta(days= 12):	
+        return 1	
+    	
+    elif y.dayofweek == 2:    	
+      if y + timedelta(days= -4) <= date and date <= y + timedelta(days= 11):	
+        return 1	
+    	
+    elif y.dayofweek == 3:    	
+      if y + timedelta(days= -5) <= date and date <= y + timedelta(days= 10):	
+        return 1	
+    	
+    elif y.dayofweek == 4:    	
+      if y + timedelta(days= -6) <= date and date <= y + timedelta(days= 9):	
+        return 1 	
+  	
+  #Pasen	
+  for y in Pasen:	
+    	
+    if y.month*100 + y.day < 407:	
+      if y + timedelta(days= -1) <= date and date <= y + timedelta(days= 14):	
+        return 1	
+        	
+    elif y.month*100 + y.day >= 407 and y.month*100 + y.day < 414:	
+      if y + timedelta(days= -8) <= date and date <= y + timedelta(days= 7):	
+        return 1	
+        	
+    elif y.month*100 + y.day >= 414:	
+      if y + timedelta(days= -15) <= date and date <= y + timedelta(days= 1):	
+        return 1	
+  	
+  #Carnaval	
+  for y in Pasen:	
+    if y + timedelta(days= -50) <= date and date <= y + timedelta(days= -42):	
+        return 1	
+      	
+      	
+  return 0	
+	
+# COMMAND ----------	
+	
+from pyspark.sql.types import *	
+# class data types https://spark.apache.org/docs/2.0.0/api/java/org/apache/spark/sql/types/DataTypes.html 	
+	
+result_schema =StructType([	
+  StructField('ds',DateType()),	
+  StructField('home_delivery_or_collect', IntegerType()),	
+  StructField('article_number',StringType()),	
+  StructField('y',FloatType()),	
+  StructField('yhat',FloatType()),	
+  StructField('yhat_lower',FloatType()),	
+  StructField('yhat_upper',FloatType()),	
+  	
+  StructField('floor',FloatType()),	
+  StructField('cap',FloatType()),	
+  StructField('is_be_scholar_holiday',IntegerType()),	
+  	
+  StructField('trend',FloatType()),	
+  StructField('trend_lower',FloatType()),	
+  StructField('trend_upper',FloatType()),	
+  StructField('multiplicative_terms',FloatType()),	
+  StructField('multiplicative_terms_lower',FloatType()),	
+  StructField('multiplicative_terms_upper',FloatType()),	
+  StructField('weekly',FloatType()),	
+  StructField('weekly_lower',FloatType()),	
+  StructField('weekly_upper',FloatType()),	
+  StructField('yearly',FloatType()),	
+  StructField('yearly_lower',FloatType()),	
+  StructField('yearly_upper',FloatType()),	
+  StructField('additive_terms',FloatType()),	
+  StructField('additive_terms_lower',FloatType()),	
+  StructField('additive_terms_upper',FloatType())	
+  	
+  ])	
+	
+	
+# COMMAND ----------	
+	
+# MAGIC %md To train the model and generate a forecast we will leverage a Pandas user-defined function (UDF).  We will define this function to receive a subset of data organized around a store and item combination.  It will return a forecast in the format identified in the previous cell:	
+	
+# COMMAND ----------	
+	
+# Grouped map UDFs	
+# https://docs.databricks.com/spark/latest/spark-sql/udf-python-pandas.html	
+	
+from pyspark.sql.functions import pandas_udf, PandasUDFType   	
+    	
+	
+@pandas_udf(result_schema, PandasUDFType.GROUPED_MAP)	
+def forecast_store_item(x):	
+  	
+  import pickle	
+  import pandas as pd	
+  from pyspark.sql.functions import current_date	
+  	
+  # holidays.countries.belgium.BE class (iterator)	
+  import holidays	
+  holidays_be = holidays.CountryHoliday('BE')	
+  # TRAIN MODEL AS BEFORE	
+  # --------------------------------------	
+  	
+  #to_datetime	
+  x['ds'] = pd.to_datetime(x['ds'] ,format = '%Y-%m-%d')	
+  	
+  # remove missing values (more likely at day-store-item level)	
+  x = x.dropna()	
+  	
+  # be sure that sundays has been removed - no need of this step I guess - also for holiday	
+  x = x[x['ds'].dt.dayofweek < 6]	
+  x = x[[y not in holidays_be for y in x['ds']]]	
+  	
+  # set a floor and a cap	
+  # to use logistic growth trend with a saturating minimum, a maximum capacity must also be specified	
+  x['cap'] = 500	
+  x['floor'] = 0	
+  	
+  	
+  #scholar be holidays	
+  x['is_be_scholar_holiday'] = x['ds'].apply(is_be_scholar_holiday)	
+  	
+  	
+  # configure the model	
+  # disabling weekly seasonality as we are removing sundays	
+  model2 = Prophet(	
+    interval_width=0.95,	
+    growth='logistic', #vs 'linear'	
+    daily_seasonality=False,	
+    weekly_seasonality=True,	
+    yearly_seasonality=True,	
+    seasonality_mode='multiplicative'	
+    )	
+  	
+  # holidays and special events Belgium	
+  # https://github.com/dr-prodigy/python-holidays	
+  	
+  model2.add_country_holidays(country_name = "BE")	
+  	
+  # add regressors	
+  model2.add_regressor('is_be_scholar_holiday')	
+  	
+  # train the model	
+  model2.fit(x)	
+  # --------------------------------------------	
+  # save model with pickle and dynamic name # normally overwrites every run, which suits us	
+  dynamic_name = str(x['home_delivery_or_collect'].iloc[0]) +"_"+ str(x['article_number'].iloc[0])	
+  pkl_path = "/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/udfgroupby_prophet_models_saved/" +  dynamic_name +".pkl"	
+  # pkl_path = "/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/udfgroupby_prophet_models_saved/test2.pkl	
+  pickle.dump(model2, open(pkl_path, 'wb')) # pas de with open ici ça fait foirer le truc	
+  	
+  # --------------------------------------	
+  	
+  # BUILD FORECAST AS BEFORE	
+  # --------------------------------------	
+  # make predictions	
+  # # define a dataset including both historical dates & X-days beyond the last available date	
+  future_pd = model2.make_future_dataframe(	
+    periods= prediction_period, #10 	
+    freq='d', 	
+    include_history=True	
+    )	
+  	
+  #to_datetime	
+  future_pd['ds'] = pd.to_datetime(future_pd['ds'] ,format = '%Y-%m-%d')	
+  	
+  # set a floor and a cap	
+  future_pd['floor'] = 0	
+  future_pd['cap'] = 500	
+  	
+  # add scholar be holidays	
+  future_pd['is_be_scholar_holiday'] = future_pd['ds'].apply(is_be_scholar_holiday)	
+        	
+  # remove sundays for future predictions	
+  # if the history contains only weekdays, then predictions should only be made for weekdays since the weekly seasonality will not be well estimated for the weekends	
+  future_pd = future_pd[future_pd['ds'].dt.dayofweek < 6]	
+  	
+  # remove holidays_be from future predictions	
+  future_pd = future_pd[[x not in holidays_be for x in future_pd['ds']]]	
+  	
+  # # predict over the dataset	
+  forecast_pd = model2.predict(future_pd)  	
+  	
+  	
+  # --------------------------------------	
+  	
+  # ASSEMBLE EXPECTED RESULT SET	
+  # --------------------------------------	
+  # get relevant fields from forecast	
+  	
+  # f_pd = forecast_pd[ ['ds','yhat', 'yhat_upper', 'yhat_lower'] ].set_index('ds')	
+  f_pd = forecast_pd[ ['ds', 'yhat', 'yhat_lower', 'yhat_upper', 'floor', 'cap', 'is_be_scholar_holiday' ,'trend', 'trend_lower', 'trend_upper',	
+       'multiplicative_terms', 'multiplicative_terms_lower',	
+       'multiplicative_terms_upper', 	
+       'weekly', 'weekly_lower', 'weekly_upper',	
+       'yearly', 'yearly_lower', 'yearly_upper', 'additive_terms',	
+       'additive_terms_lower', 'additive_terms_upper'] ].set_index('ds')	
+	
+  	
+  # get relevant fields from history	
+  h_pd = x[ ['ds','home_delivery_or_collect','article_number','y'] ].set_index('ds') #, 'floor', 'cap', 'is_be_scholar_holiday'	
+	
+  	
+  	
+  	
+  # join history and forecast	
+  results_pd = f_pd.join( h_pd, how='left' )	
+#   results_pd = pd.concat([h_pd, f_pd]) # moi plutot concat que join non ? surtout si je veux garder mes colonnes avec le meme nom. en fait ça double parce que les forecast (ligne bleue) ont aussi des dates dans le passé	
+  results_pd.reset_index(level=0, inplace=True) # besoin de ça ? oui	
+  	
+  # get store & item from incoming data set	
+  results_pd['home_delivery_or_collect'] = x['home_delivery_or_collect'].iloc[0]	
+  results_pd['article_number'] = x['article_number'].iloc[0]	
+  # --------------------------------------	
+  	
+  	
+  	
+  	
+  	
+  	
+  # return expected dataset	
+  	
+	
+  return results_pd[ ['ds', 'home_delivery_or_collect', 'article_number', 'y', 'yhat', 'yhat_lower', 'yhat_upper', 'floor', 'cap', 'is_be_scholar_holiday', 'trend', 'trend_lower', 'trend_upper',	
+       'multiplicative_terms', 'multiplicative_terms_lower',	
+       'multiplicative_terms_upper', 	
+       'weekly', 'weekly_lower', 'weekly_upper',	
+       'yearly', 'yearly_lower', 'yearly_upper', 'additive_terms',	
+       'additive_terms_lower', 'additive_terms_upper'] ]	
+        	
+  	
+ 	
+	
+# COMMAND ----------	
+	
+#testtt	
+result_schema2 =StructType([	
+  StructField('ds',DateType()),	
+#   StructField('home_delivery_or_collect', IntegerType()),	
+#   StructField('article_number',StringType()),	
+#   StructField('y',FloatType()),	
+  	
+#   StructField('yhat',FloatType()),	
+#   StructField('yhat_lower',FloatType()),	
+#   StructField('yhat_upper',FloatType()),	
+  	
+  StructField('floor',FloatType()),	
+  StructField('cap',FloatType()),	
+  StructField('is_be_scholar_holiday',IntegerType())	
+#   ,	
+  	
+#   StructField('trend',FloatType()),	
+#   StructField('trend_lower',FloatType()),	
+#   StructField('trend_upper',FloatType()),	
+#   StructField('multiplicative_terms',FloatType()),	
+#   StructField('multiplicative_terms_lower',FloatType()),	
+#   StructField('multiplicative_terms_upper',FloatType()),	
+#   StructField('weekly',FloatType()),	
+#   StructField('weekly_lower',FloatType()),	
+#   StructField('weekly_upper',FloatType()),	
+#   StructField('yearly',FloatType()),	
+#   StructField('yearly_lower',FloatType()),	
+#   StructField('yearly_upper',FloatType()),	
+#   StructField('additive_terms',FloatType()),	
+#   StructField('additive_terms_lower',FloatType()),	
+#   StructField('additive_terms_upper',FloatType())	
+  	
+  ])	
+	
+@pandas_udf(result_schema2, PandasUDFType.GROUPED_MAP)	
+def forecast_store_item2(x):	
+  	
+  import pickle	
+  import pandas as pd	
+  from pyspark.sql.functions import current_date	
+  	
+  # holidays.countries.belgium.BE class (iterator)	
+  import holidays	
+  holidays_be = holidays.CountryHoliday('BE')	
+  # TRAIN MODEL AS BEFORE	
+  # --------------------------------------	
+  	
+  #to_datetime	
+  x['ds'] = pd.to_datetime(x['ds'] ,format = '%Y-%m-%d')	
+  	
+  # remove missing values (more likely at day-store-item level)	
+  x = x.dropna()	
+  	
+  # be sure that sundays has been removed - no need of this step I guess - also for holiday	
+  x = x[x['ds'].dt.dayofweek < 6]	
+  x = x[[y not in holidays_be for y in x['ds']]]	
+  	
+  # set a floor and a cap	
+  # to use logistic growth trend with a saturating minimum, a maximum capacity must also be specified	
+  x['cap'] = 500	
+  x['floor'] = 0	
+  	
+  	
+  #scholar be holidays	
+  x['is_be_scholar_holiday'] = x['ds'].apply(is_be_scholar_holiday)	
+  	
+  	
+  # configure the model	
+  # disabling weekly seasonality as we are removing sundays	
+  model2 = Prophet(	
+    interval_width=0.95,	
+    growth='logistic', #vs 'linear'	
+    daily_seasonality=False,	
+    weekly_seasonality=True,	
+    yearly_seasonality=True,	
+    seasonality_mode='multiplicative'	
+    )	
+  	
+  # holidays and special events Belgium	
+  # https://github.com/dr-prodigy/python-holidays	
+  	
+  model2.add_country_holidays(country_name = "BE")	
+  	
+  # add regressors	
+  model2.add_regressor('is_be_scholar_holiday')	
+  	
+  # train the model	
+  model2.fit(x)	
+  # --------------------------------------------	
+  # save model with pickle and dynamic name # normally overwrites every run, which suits us	
+  dynamic_name = str(x['home_delivery_or_collect'].iloc[0]) +"_"+ str(x['article_number'].iloc[0])	
+  pkl_path = "/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/udfgroupby_prophet_models_saved/" +  dynamic_name +".pkl"	
+  # pkl_path = "/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/udfgroupby_prophet_models_saved/test2.pkl	
+  pickle.dump(model2, open(pkl_path, 'wb')) # pas de with open ici ça fait foirer le truc	
+  	
+  # --------------------------------------	
+  	
+  # BUILD FORECAST AS BEFORE	
+  # --------------------------------------	
+  # make predictions	
+  # # define a dataset including both historical dates & X-days beyond the last available date	
+  future_pd = model2.make_future_dataframe(	
+    periods= prediction_period, #10 	
+    freq='d', 	
+    include_history=True	
+    )	
+  	
+  #to_datetime	
+  future_pd['ds'] = pd.to_datetime(future_pd['ds'] ,format = '%Y-%m-%d')	
+  	
+  # set a floor and a cap	
+  future_pd['floor'] = 0	
+  future_pd['cap'] = 500	
+  	
+  # add scholar be holidays	
+  future_pd['is_be_scholar_holiday'] = future_pd['ds'].apply(is_be_scholar_holiday)	
+        	
+  # remove sundays for future predictions	
+  # if the history contains only weekdays, then predictions should only be made for weekdays since the weekly seasonality will not be well estimated for the weekends	
+  future_pd = future_pd[future_pd['ds'].dt.dayofweek < 6]	
+  	
+  # remove holidays_be from future predictions	
+  future_pd = future_pd[[x not in holidays_be for x in future_pd['ds']]]	
+  	
+  # # predict over the dataset	
+  forecast_pd = model2.predict(future_pd)  	
+  	
+  	
+  # --------------------------------------	
+  	
+  # ASSEMBLE EXPECTED RESULT SET	
+  # --------------------------------------	
+  # get relevant fields from forecast	
+  	
+  # f_pd = forecast_pd[ ['ds','yhat', 'yhat_upper', 'yhat_lower'] ].set_index('ds')	
+  f_pd = forecast_pd[ ['ds', 'yhat', 'yhat_lower', 'yhat_upper', 'floor', 'cap', 'is_be_scholar_holiday' ,'trend', 'trend_lower', 'trend_upper',	
+       'multiplicative_terms', 'multiplicative_terms_lower',	
+       'multiplicative_terms_upper', 	
+       'weekly', 'weekly_lower', 'weekly_upper',	
+       'yearly', 'yearly_lower', 'yearly_upper', 'additive_terms',	
+       'additive_terms_lower', 'additive_terms_upper'] ]	
+	
+  	
+#   f_pd.reset_index(level=0, inplace=True)	
+  return future_pd	
+
+	
+  
+  	
+ 
+        	
+  	
+ 	
+	
+# COMMAND ----------	
+	
+help(Prophet)  	
+	
+# COMMAND ----------	
+	
+# MAGIC %md There's a lot taking place within our UDF, but if you compare the first two blocks of code within which the model is being trained and a forecast is being built to the cells in the previous portion of this notebook, you'll see the code is pretty much the same as before. It's only in the assembly of the required result set that truly new code is being introduced and it consists of fairly standard Pandas dataframe manipulations.	
+	
+# COMMAND ----------	
+	
+# MAGIC %md Now let's call our UDF to build our forecasts.  We do this by grouping our historical dataset around store and item.  We then apply our UDF to each group and tack on today's date as our *training_date* for data management purposes:	
+	
+# COMMAND ----------	
+	
+from pyspark.sql.functions import current_date, col, count	
+from pyspark.sql import Window	
+from pyspark.sql import functions as F	
+	
+w = Window.partitionBy('home_delivery_or_collect', 'article_number')	
+# ww = Window.partitionBy('concat_store_and_article_numbers')	
+# www = Window.partitionBy('article_number')	
+	
+	
+a = store_item_history.select('ds', 'home_delivery_or_collect', 'article_number', 'y', count('home_delivery_or_collect').over(w).alias('counts_store')).sort('ds')	
+	
+# a = store_item_history.select('ds', 'store_number', 'article_number', 'y', count('store_number').alias('counts_store'), count('article_number').alias('counts_article'), count('store_number').over(w).alias('counts_store_over_w')).sort('ds')	
+	
+# add concat store/article column	
+# a = a.withColumn("concat_store_and_article_numbers",F.concat(col("store_number"), col("article_number")))	
+	
+	
+# a = a.select('ds', 'store_number', 'article_number', 'y', 'counts_store', 'concat_store_and_article_numbers', count('concat_store_and_article_numbers').over(ww).alias('counts_concat'))	
+	
+	
+	
+	
+# COMMAND ----------	
+	
+from pyspark.sql import functions as F	
+# a = a.select('ds', 'store_number', 'article_number', 'y', 'counts_store', 'concat_store_and_article_numbers', 'counts_concat', F.approx_count_distinct('ds').over(ww).alias('counts_dist_ds')).sort('ds')	
+a = a.select('ds', 'home_delivery_or_collect', 'article_number', 'y', 'counts_store', F.approx_count_distinct('ds').over(w).alias('counts_dist_ds')).sort('ds')	
+	
+	
+# COMMAND ----------	
+	
+# print(a.count())	
+a = a.filter(a["counts_store"]>1)	
+# print(a.count())	
+# a = a.filter(a["counts_concat"]>1)	
+# print(a.count())	
+	
+a = a.filter(a["counts_dist_ds"]>1)	
+# print(a.count())di	
+	
+# COMMAND ----------	
+	
+print(type(a))	
+print(a.dtypes)	
+	
+# COMMAND ----------	
+	
+# replace Null by 0	
+a = a.withColumn("y", F.when(F.col("y").isNull(), 0).otherwise(F.col("y")))	
+	
+# COMMAND ----------	
+	
+bb = a.toPandas()	
+cc = bb	
+	
+# COMMAND ----------	
+	
+display(bb)	
+	
+# COMMAND ----------	
+	
+bb.index	
+	
+# COMMAND ----------	
+	
+#TO SEE THE DETAIL OF THE COLUMNS - WATCH OUT IT S NO GROUPBY	
+import pickle	
+import pandas as pd	
+from pyspark.sql.functions import current_date	
+	
+	
+# holidays.countries.belgium.BE class (iterator)	
+import holidays	
+holidays_be = holidays.CountryHoliday('BE')	
+	
+# TRAIN MODEL AS BEFORE	
+# --------------------------------------	
+	
+#to_datetime	
+bb['ds'] = pd.to_datetime(bb['ds'] ,format = '%Y-%m-%d')	
+	
+# remove missing values (more likely at day-store-item level)	
+bb = bb.dropna()	
+	
+# be sure that sundays has been removed - no need of this step I guess - also for holiday	
+bb = bb[bb['ds'].dt.dayofweek < 6]	
+bb = bb[[y not in holidays_be for y in bb['ds']]]	
+	
+# set a floor and a cap	
+# to use logistic growth trend with a saturating minimum, a maximum capacity must also be specified	
+bb['cap'] = 500	
+bb['floor'] = 0	
+	
+	
+#scholar be holidays	
+bb['is_be_scholar_holiday'] = bb['ds'].apply(is_be_scholar_holiday)	
+	
+	
+# configure the model	
+# disabling weekly seasonality as we are removing sundays	
+model3 = Prophet(	
+  interval_width=0.95,	
+  growth='logistic', #vs 'linear'	
+  daily_seasonality=False,	
+  weekly_seasonality=True,	
+  yearly_seasonality=True,	
+  seasonality_mode='multiplicative'	
+  )	
+	
+# holidays and special events Belgium	
+# https://github.com/dr-prodigy/python-holidays	
+	
+model3.add_country_holidays(country_name = "BE")	
+	
+# add regressors	
+model3.add_regressor('is_be_scholar_holiday')	
+	
+# train the model	
+model3.fit(bb)	
+# --------------------------------------------	
+# # save model with pickle and dynamic name # normally overwrites every run, which suits us	
+# dynamic_name = str(x['home_delivery_or_collect'].iloc[0]) +"_"+ str(x['article_number'].iloc[0])	
+# pkl_path = "/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/udfgroupby_prophet_models_saved/" +  dynamic_name +".pkl"	
+# # pkl_path = "/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/udfgroupby_prophet_models_saved/test2.pkl	
+# pickle.dump(model2, open(pkl_path, 'wb')) # pas de with open ici ça fait foirer le truc	
+	
+# # --------------------------------------	
+	
+# BUILD FORECAST AS BEFORE	
+# --------------------------------------	
+# make predictions	
+# # define a dataset including both historical dates & X-days beyond the last available date	
+future_pd3 = model3.make_future_dataframe(	
+  periods= prediction_period, #10 	
+  freq='d', 	
+  include_history=True	
+  )	
+	
+#to_datetime	
+future_pd3['ds'] = pd.to_datetime(future_pd3['ds'] ,format = '%Y-%m-%d')	
+	
+# set a floor and a cap	
+future_pd3['floor'] = 0	
+future_pd3['cap'] = 500	
+	
+# add scholar be holidays	
+future_pd3['is_be_scholar_holiday'] = future_pd3['ds'].apply(is_be_scholar_holiday)	
+	
+# remove sundays for future predictions	
+# if the history contains only weekdays, then predictions should only be made for weekdays since the weekly seasonality will not be well estimated for the weekends	
+future_pd3 = future_pd3[future_pd3['ds'].dt.dayofweek < 6]	
+	
+# remove holidays_be from future predictions	
+future_pd3 = future_pd3[[x not in holidays_be for x in future_pd3['ds']]]	
+	
+	
+	
+# # predict over the dataset	
+forecast_pd3 = model3.predict(future_pd3)  	
+	
+forecast_pd3.head()	
+	
+# COMMAND ----------	
+	
+	
+	
+# ASSEMBLE EXPECTED RESULT SET	
+# --------------------------------------	
+# get relevant fields from forecast	
+	
+# f_pd = forecast_pd[ ['ds','yhat', 'yhat_upper', 'yhat_lower'] ].set_index('ds')	
+f_pd3 = forecast_pd3[ ['ds', 'yhat', 'yhat_lower', 'yhat_upper', 'floor', 'cap', 'is_be_scholar_holiday', 'trend', 'trend_lower', 'trend_upper',	
+     'multiplicative_terms', 'multiplicative_terms_lower',	
+     'multiplicative_terms_upper', 	
+     'weekly', 'weekly_lower', 'weekly_upper',	
+     'yearly', 'yearly_lower', 'yearly_upper', 'additive_terms',	
+     'additive_terms_lower', 'additive_terms_upper'] ].set_index('ds')	
+	
+# get relevant fields from history	
+h_pd3 = bb[ ['ds','home_delivery_or_collect','article_number','y'] ].set_index('ds') #, 'floor', 'cap', 'is_be_scholar_holiday'	
+	
+f_pd3.head()	
+	
+# COMMAND ----------	
+	
+	
+	
+# join history and forecast	
+results_pd3 = f_pd3.join( h_pd3, how='left' )	
+#   results_pd = pd.concat([h_pd, f_pd]) # moi plutot concat que join non ? surtout si je veux garder mes colonnes avec le meme nom. en fait ça double parce que les forecast (ligne bleue) ont aussi des dates dans le passé	
+results_pd3.reset_index(level=0, inplace=True) # besoin de ça ? oui	
+	
+# get store & item from incoming data set	
+results_pd3['home_delivery_or_collect'] = bb['home_delivery_or_collect'].iloc[0]	
+results_pd3['article_number'] = bb['article_number'].iloc[0]	
+# --------------------------------------	
+results_pd3.head()	
+	
+# COMMAND ----------	
+	
+results_pd3[ ['ds', 'home_delivery_or_collect', 'article_number', 'y', 'yhat', 'yhat_lower', 'yhat_upper', 'floor', 'cap', 'is_be_scholar_holiday', 'trend', 'trend_lower', 'trend_upper',	
+       'multiplicative_terms', 'multiplicative_terms_lower',	
+       'multiplicative_terms_upper', 	
+       'weekly', 'weekly_lower', 'weekly_upper',	
+       'yearly', 'yearly_lower', 'yearly_upper', 'additive_terms',	
+       'additive_terms_lower', 'additive_terms_upper'] ].head()	
+	
+# COMMAND ----------	
+	
+print(type(results_pd3))	
+	
+# COMMAND ----------	
+	
+forecast_pd3.columns	
+	
+# COMMAND ----------	
+	
+display(a)	
+	
+# COMMAND ----------	
+	
+results = (	
+    a	
+    .groupBy('home_delivery_or_collect', 'article_number')	
+    .apply(forecast_store_item)	
+    .withColumn('training_date', current_date()                )	
+           )	
+	
+results.createOrReplaceTempView('new_forecasts')	
+	
+	
+display(results)	
+	
+# createOrReplaceTempView creates (or replaces if that view name already exists) a lazily evaluated "view" that you can then use like a hive table in Spark SQL. It does not persist to memory unless you cache the dataset that underpins the view. We can use table('new_forecasts') too	
+	
+# COMMAND ----------	
+	
+# testtt	
+results2 = (	
+    a	
+    .groupBy('home_delivery_or_collect', 'article_number')	
+    .apply(forecast_store_item2)	
+    .withColumn('training_date', current_date()                )	
+           )	
+	
+	
+	
+display(results2)	
+	
+# createOrReplaceTempView creates (or replaces if that view name already exists) a lazily evaluated "view" that you can then use like a hive table in Spark SQL. It does not persist to memory unless you cache the dataset that underpins the view. We can use table('new_forecasts') too	
+	
+# COMMAND ----------	
+	
+	
+	
+# COMMAND ----------	
+	
+import pickle	
+dynamic_name2 = st + "_" + art	
+print(dynamic_name2)	
+pkl_path = "/dbfs/mnt/gen2/prod/DataScience/sandbox/gmc/prophet/udfgroupby_prophet_models_saved/" +  dynamic_name2 +".pkl"	
+print(pkl_path)	
+model = pickle.load(open(pkl_path, 'rb'))	
+print(type(model))	
+	
+# COMMAND ----------	
+	
+results_filtered = results.filter(results["home_delivery_or_collect"]==st).filter(results["article_number"]==art)	
+results_filtered_pandas = results_filtered.toPandas()	
+	
+results_filtered.createOrReplaceTempView('results_filtered')	
+print(type(results_filtered_pandas))	
+	
+# COMMAND ----------	
+	
+import pandas as pd	
+results_filtered_pandas['ds'] = pd.to_datetime(results_filtered_pandas['ds'] ,format = '%Y-%m-%d')# ,errors = 'coerce'	
+results_filtered_pandas['training_date'] = pd.to_datetime(results_filtered_pandas['training_date'] ,format = '%Y-%m-%d')	
+	
+# COMMAND ----------	
+	
+display(results_filtered_pandas)	
+	
+# COMMAND ----------	
+	
+# list Belgium Holidays - Wapenstilstand: Armistice Pinksteren: Pentecote Hemelvaart: ascension	
+# OLH AND OLV hemelvaart ? 	
+# Pinksteren + Pinksterenmaandag ? 	
+model.train_holiday_names	
+	
+# COMMAND ----------	
+	
+help(Prophet.add_regressor)	
+	
+# COMMAND ----------	
+	
+predict_fig = model.plot( results_filtered_pandas, xlabel='date', ylabel='sales')	
+display(predict_fig)	
+	
+# COMMAND ----------	
+	
+#changepoints	
+from fbprophet.plot import add_changepoints_to_plot	
+fig01 = model.plot(results_filtered_pandas, xlabel='date', ylabel='sales')	
+a = add_changepoints_to_plot(fig01.gca(), model, results_filtered_pandas)	
+display(fig01)	
+	
+# COMMAND ----------	
+	
+trends_fig = model.plot_components(results_filtered_pandas)	
+display(trends_fig)	
+	
+# COMMAND ----------	
+	
+aaa = model.predict_seasonal_components(results_filtered_pandas)	
+display(aaa)	
+	
+# COMMAND ----------	
+	
+# Evaluation method n°1: compare variation (%) between prediction and truth. Show distribution through an histogram. Goal is to have the most of predictions between the -10 and 10% bins	
+	
+# COMMAND ----------	
+	
+# get the truth	
+# enddate_evaluation	
+si_evaluation = spark.read.format('csv').options(header=True, inferSchema= False, sep = ",").load("mnt/gen2/prod/Prepared/Reporting/Facts/ScannedItem/").filter('Year * 10000 + Month * 100 + Day >' + "'{}'".format(enddate)+' AND Year * 10000 + Month * 100 + Day <='+ "'{}'".format(enddate_evaluation))	
+	
+# change date column format from string to date	
+si_evaluation = si_evaluation.withColumn('dl_emission_date_id', to_date(col('dl_emission_date_id'), "yyyyMMdd"))	
+	
+# add mapping column ecommerce home delivery (1) or collect (2) otherwise (0)	
+si_evaluation = si_evaluation.withColumn('home_delivery_or_collect', when(	
+                                                    col('is_ecommerce') == 'Y', 	
+                                                    when(	
+                                                         col('store_number') == '140007',1	
+                                                        ).otherwise(2)	
+                                                    ).otherwise(0)	
+                                                    )	
+	
+	
+# make the dataframe queriable as a temporary view	
+si_evaluation.createOrReplaceTempView('si_evaluation')	
+display(si_evaluation)	
+	
+# COMMAND ----------	
+	
+print(enddate2)	
+print(enddate_evaluation2)	
+print(enddate)	
+print(enddate_evaluation)	
+	
+
+
+	
+# COMMAND ----------	
+	
+sql_query = '''	
+SELECT 	
+  	
+  rf.ds,	
+  rf.home_delivery_or_collect,	
+  rf.article_number,	
+  rf.y,	
+  rf.yhat,	
+  sum(sie.number_of_items) AS y_truth	
+  	
+  	
+FROM 	
+  	
+  results_filtered AS rf	
+  LEFT JOIN si_evaluation AS sie	
+    ON rf.article_number = sie.article_number AND rf.ds = sie.dl_emission_date_id AND rf.home_delivery_or_collect = sie.home_delivery_or_collect 	
+	
+WHERE 	
+  rf.ds > "''' + enddate2 + '''" AND rf.ds <= "''' + enddate_evaluation2 + '''"	
+	
+GROUP BY	
+  rf.ds,	
+  rf.home_delivery_or_collect,	
+  rf.article_number,	
+  rf.y,	
+  rf.yhat	
+  	
+ORDER BY	
+  rf.ds	
+'''	
+	
+# COMMAND ----------	
+	
+evaluation01 = spark.sql(sql_query).cache()	
+	
+# COMMAND ----------	
+	
+evaluation01 = evaluation01.withColumn('%var day', (col('yhat')-col('y_truth'))/col('yhat')*100).withColumn('training_date', current_date())	
+evaluation01 = evaluation01.withColumn("y_truth", F.when(F.col("y_truth").isNull(), 0).otherwise(F.col("y_truth"))).withColumn("yhat", F.when(F.col("yhat").isNull(), 0).otherwise(F.col("yhat")))	
+evaluation01 = evaluation01.withColumn('yhat', round(col('yhat'), 2)).withColumn('y_truth', round(col('y_truth'), 2)).withColumn('%var day', round(col('%var day'), 2))	
+evaluation01.createOrReplaceTempView('evaluation01')	
+display(evaluation01) # show as histogram 	
+	
+# COMMAND ----------	
+	
+display(evaluation01)	
+	
+# COMMAND ----------	
+	
+display(evaluation01)	
+	
+# COMMAND ----------	
+	
+# Evaluation method n°2: Aggregate totals on the full tested period	
+	
+# COMMAND ----------	
+	
+# MAGIC %sql	
+# MAGIC -- error on the full evaluation period (generally a month)	
+# MAGIC SELECT COUNT(ds), SUM(yhat), SUM(y_truth), SUM(yhat - y_truth)	
+# MAGIC FROM evaluation01	
+# MAGIC GROUP BY article_number	
+	
+# COMMAND ----------	
+	
+# Evaluation method n°3: MAE MSE RMSE	
+	
+# COMMAND ----------	
+	
+# MAGIC %md Visual inspection is useful, but a better way to evaulate the forecast is to calculate Mean Absolute Error, Mean Squared Error and Root Mean Squared Error values for the predicted relative to the actual values in our set.	
+# MAGIC Using the UDF technique, we can generate evaluation metrics for each store-item forecast as follows.	
+	
+# COMMAND ----------	
+	
+import pandas as pd	
+	
+# schema of expected result set	
+eval_schema =StructType([	
+  StructField('training_date', DateType()),	
+  StructField('home_delivery_or_collect', StringType()),	
+  StructField('article_number', StringType()),	
+  StructField('mae', FloatType()),	
+  StructField('mse', FloatType()),	
+  StructField('rmse', FloatType())	
+  ])	
+	
+# define udf to calculate metrics	
+@pandas_udf( eval_schema, PandasUDFType.GROUPED_MAP )	
+def evaluate_forecast( evaluation_pd ):	
+  from sklearn.metrics import mean_squared_error, mean_absolute_error	
+  from math import sqrt	
+  from datetime import date	
+  	
+  # get store & item in incoming data set	
+  training_date = evaluation_pd['training_date'].iloc[0]	
+  home_delivery_or_collect = evaluation_pd['home_delivery_or_collect'].iloc[0]	
+  article_number = evaluation_pd['article_number'].iloc[0]	
+  	
+  # calulate evaluation metrics	
+  mae = mean_absolute_error( evaluation_pd['y_truth'], evaluation_pd['yhat'] )	
+  mse = mean_squared_error( evaluation_pd['y_truth'], evaluation_pd['yhat'] )	
+  rmse = sqrt( mse )	
+  	
+  # assemble result set	
+  results = {'training_date':[training_date], 'home_delivery_or_collect':[home_delivery_or_collect], 'article_number':[article_number], 'mae':[mae], 'mse':[mse], 'rmse':[rmse]}	
+  return pd.DataFrame.from_dict( results )	
+	
+	
+	
+	
+results_evaluation = (	
+  evaluation01	
+    .groupBy('training_date', 'home_delivery_or_collect', 'article_number')	
+    .apply(evaluate_forecast)	
+    )	
+	
+print(type(results_evaluation))	
+results_evaluation.createOrReplaceTempView('new_forecast_evals')	
+display(results_evaluation)	
+	
